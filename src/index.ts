@@ -2407,6 +2407,820 @@ server.registerTool(
   }
 );
 
+// Tool: Bulk Update Transaction Status
+server.registerTool(
+  "bulk-update-transaction-status",
+  {
+    title: "Bulk Update Transaction Status",
+    description: "Update the cleared and approved status of multiple transactions for reconciliation",
+    inputSchema: {
+      budgetId: z.string().describe("Budget ID (use 'last-used' for last used budget)"),
+      updates: z.array(z.object({
+        transactionId: z.string().describe("Transaction ID to update"),
+        cleared: z.enum(['cleared', 'uncleared', 'reconciled']).optional().describe("New cleared status"),
+        approved: z.boolean().optional().describe("New approved status")
+      })).describe("Array of transaction updates")
+    }
+  },
+  async ({ budgetId, updates }) => {
+    try {
+      const client = getYNABClient();
+      
+      // If budgetId is "last-used", get the default budget
+      let actualBudgetId = budgetId;
+      if (budgetId === "last-used") {
+        const budgets = await client.getBudgets();
+        if (budgets.data.default_budget) {
+          actualBudgetId = budgets.data.default_budget.id;
+        } else {
+          throw new Error("No default budget found");
+        }
+      }
+      
+      // Prepare updates for bulk operation
+      const bulkUpdates = updates.map(update => ({
+        transactionId: update.transactionId,
+        cleared: update.cleared,
+        approved: update.approved
+      }));
+      
+      // Perform bulk update
+      const results = await client.bulkUpdateTransactionStatus(actualBudgetId, bulkUpdates);
+      
+      // Helper function to format status
+      const formatStatus = (cleared: string, approved: boolean) => {
+        const clearedText = cleared.charAt(0).toUpperCase() + cleared.slice(1);
+        const approvedText = approved ? '✓ Approved' : '⚠️ Unapproved';
+        return `${clearedText}, ${approvedText}`;
+      };
+      
+      let content = `# Bulk Transaction Status Update Complete\n\n`;
+      content += `## Summary\n`;
+      content += `- **Total Updates Requested**: ${updates.length}\n`;
+      content += `- **Successful Updates**: ${results.length}\n`;
+      content += `- **Failed Updates**: ${updates.length - results.length}\n\n`;
+      
+      if (results.length > 0) {
+        content += `## Updated Transactions\n\n`;
+        
+        for (let i = 0; i < results.length; i++) {
+          const result = results[i];
+          const update = updates[i];
+          const transaction = result.data.transaction;
+          
+          content += `### ${transaction.payee_name || 'No Payee'} - ${transaction.date}\n`;
+          content += `- **Amount**: $${(transaction.amount / 1000).toFixed(2)}\n`;
+          content += `- **Status**: ${formatStatus(transaction.cleared, transaction.approved)}\n`;
+          content += `- **Account**: ${transaction.account_name}\n`;
+          content += `- **Transaction ID**: ${transaction.id}\n`;
+          
+          // Show what was updated
+          if (update.cleared) {
+            content += `- **Updated Cleared Status**: ${update.cleared}\n`;
+          }
+          if (update.approved !== undefined) {
+            content += `- **Updated Approved Status**: ${update.approved ? 'Approved' : 'Unapproved'}\n`;
+          }
+          content += `\n`;
+        }
+      }
+      
+      if (updates.length - results.length > 0) {
+        content += `## Failed Updates\n`;
+        content += `${updates.length - results.length} transaction(s) could not be updated. This may be due to invalid transaction IDs or network issues.\n`;
+      }
+      
+      return {
+        content: [{ type: "text", text: content }]
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error: ${error instanceof Error ? error.message : String(error)}` }],
+        isError: true
+      };
+    }
+  }
+);
+
+// Tool: Reconcile Account Transactions
+server.registerTool(
+  "reconcile-account-transactions",
+  {
+    title: "Reconcile Account Transactions",
+    description: "Mark all transactions in an account as reconciled up to a specific date",
+    inputSchema: {
+      budgetId: z.string().describe("Budget ID (use 'last-used' for last used budget)"),
+      accountId: z.string().describe("Account ID to reconcile"),
+      reconciliationDate: z.string().describe("Reconciliation date (ISO format: YYYY-MM-DD) - transactions on or before this date will be reconciled"),
+      endingBalance: z.number().optional().describe("Expected ending balance in dollars for verification")
+    }
+  },
+  async ({ budgetId, accountId, reconciliationDate, endingBalance }) => {
+    try {
+      const client = getYNABClient();
+      
+      // If budgetId is "last-used", get the default budget
+      let actualBudgetId = budgetId;
+      if (budgetId === "last-used") {
+        const budgets = await client.getBudgets();
+        if (budgets.data.default_budget) {
+          actualBudgetId = budgets.data.default_budget.id;
+        } else {
+          throw new Error("No default budget found");
+        }
+      }
+      
+      // Get account details
+      const accountResponse = await client.getAccount(actualBudgetId, accountId);
+      const account = accountResponse.data.account;
+      
+      // Get all transactions for the account
+      const transactionsResponse = await client.getAccountTransactions(actualBudgetId, accountId);
+      
+      // Filter transactions that should be reconciled (on or before reconciliation date and not already reconciled)
+      const transactionsToReconcile = transactionsResponse.data.transactions.filter(t => 
+        !t.deleted && 
+        t.date <= reconciliationDate && 
+        t.cleared !== 'reconciled'
+      );
+      
+      if (transactionsToReconcile.length === 0) {
+        let content = `# Account Reconciliation - No Transactions to Reconcile\n\n`;
+        content += `## Account: ${account.name}\n`;
+        content += `- **Reconciliation Date**: ${reconciliationDate}\n`;
+        content += `- **Current Balance**: $${(account.balance / 1000).toFixed(2)}\n`;
+        content += `\nAll transactions on or before ${reconciliationDate} are already reconciled.\n`;
+        
+        return {
+          content: [{ type: "text", text: content }]
+        };
+      }
+      
+      // Prepare bulk updates - mark as reconciled and approved
+      const bulkUpdates = transactionsToReconcile.map(t => ({
+        transactionId: t.id,
+        cleared: 'reconciled' as const,
+        approved: true
+      }));
+      
+      // Perform bulk reconciliation
+      const results = await client.bulkUpdateTransactionStatus(actualBudgetId, bulkUpdates);
+      
+      // Calculate reconciliation summary
+      const totalReconciledAmount = transactionsToReconcile.reduce((sum, t) => sum + t.amount, 0);
+      const reconciliationDateObj = new Date(reconciliationDate);
+      
+      // Helper functions
+      const formatAmount = (amount: number) => {
+        const value = amount / 1000;
+        return value >= 0 ? `+$${value.toFixed(2)}` : `-$${Math.abs(value).toFixed(2)}`;
+      };
+      
+      const formatDate = (dateStr: string) => {
+        const date = new Date(dateStr);
+        return date.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+      };
+      
+      let content = `# Account Reconciliation Complete\n\n`;
+      content += `## Account: ${account.name}\n`;
+      content += `- **Reconciliation Date**: ${formatDate(reconciliationDate)}\n`;
+      content += `- **Transactions Reconciled**: ${results.length}\n`;
+      content += `- **Total Amount Reconciled**: ${formatAmount(totalReconciledAmount)}\n`;
+      content += `- **Current Account Balance**: $${(account.balance / 1000).toFixed(2)}\n`;
+      
+      if (endingBalance !== undefined) {
+        const balanceDifference = (account.balance / 1000) - endingBalance;
+        content += `- **Expected Ending Balance**: $${endingBalance.toFixed(2)}\n`;
+        content += `- **Balance Difference**: ${balanceDifference >= 0 ? '+' : ''}$${balanceDifference.toFixed(2)}\n`;
+        
+        if (Math.abs(balanceDifference) > 0.01) {
+          content += `\n⚠️ **Warning**: There is a difference between the expected and actual balance. This may indicate missing transactions or data entry errors.\n`;
+        } else {
+          content += `\n✅ **Success**: Account balance matches expected ending balance!\n`;
+        }
+      }
+      
+      content += `\n## Reconciled Transactions\n\n`;
+      
+      // Group transactions by month for better readability
+      const transactionsByMonth = new Map<string, typeof transactionsToReconcile>();
+      
+      for (const transaction of transactionsToReconcile) {
+        const monthKey = transaction.date.substring(0, 7); // YYYY-MM
+        if (!transactionsByMonth.has(monthKey)) {
+          transactionsByMonth.set(monthKey, []);
+        }
+        transactionsByMonth.get(monthKey)!.push(transaction);
+      }
+      
+      // Sort months in descending order
+      const sortedMonths = Array.from(transactionsByMonth.keys()).sort().reverse();
+      
+      for (const month of sortedMonths) {
+        const monthTransactions = transactionsByMonth.get(month)!;
+        const monthDate = new Date(month + '-01');
+        content += `### ${monthDate.toLocaleDateString('en-US', { year: 'numeric', month: 'long' })}\n\n`;
+        
+        for (const t of monthTransactions.sort((a, b) => b.date.localeCompare(a.date))) {
+          content += `- **${formatDate(t.date)}** - ${t.payee_name || 'No Payee'} - ${formatAmount(t.amount)}\n`;
+        }
+        content += `\n`;
+      }
+      
+      content += `## Next Steps\n`;
+      content += `- All transactions through ${formatDate(reconciliationDate)} have been marked as reconciled\n`;
+      content += `- Review any balance discrepancies if present\n`;
+      content += `- Consider reconciling again after your next bank statement\n`;
+      
+      return {
+        content: [{ type: "text", text: content }]
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error: ${error instanceof Error ? error.message : String(error)}` }],
+        isError: true
+      };
+    }
+  }
+);
+
+// Tool: Find Transactions for Reconciliation
+server.registerTool(
+  "find-transactions-for-reconciliation",
+  {
+    title: "Find Transactions for Reconciliation",
+    description: "Find transactions that need reconciliation based on their cleared and approved status",
+    inputSchema: {
+      budgetId: z.string().describe("Budget ID (use 'last-used' for last used budget)"),
+      accountId: z.string().optional().describe("Account ID to filter by (optional - if not provided, searches all accounts)"),
+      cleared: z.enum(['cleared', 'uncleared', 'reconciled']).optional().describe("Filter by cleared status"),
+      approved: z.boolean().optional().describe("Filter by approved status"),
+      sinceDate: z.string().optional().describe("Only include transactions on or after this date (ISO format: YYYY-MM-DD)"),
+      untilDate: z.string().optional().describe("Only include transactions on or before this date (ISO format: YYYY-MM-DD)"),
+      limit: z.number().optional().describe("Maximum number of transactions to return (default: 50)")
+    }
+  },
+  async ({ budgetId, accountId, cleared, approved, sinceDate, untilDate, limit = 50 }) => {
+    try {
+      const client = getYNABClient();
+      
+      // If budgetId is "last-used", get the default budget
+      let actualBudgetId = budgetId;
+      if (budgetId === "last-used") {
+        const budgets = await client.getBudgets();
+        if (budgets.data.default_budget) {
+          actualBudgetId = budgets.data.default_budget.id;
+        } else {
+          throw new Error("No default budget found");
+        }
+      }
+      
+      // Get transactions using the client method
+      const transactionsResponse = await client.getTransactionsByStatus(
+        actualBudgetId, 
+        accountId, 
+        cleared, 
+        approved, 
+        { since_date: sinceDate }
+      );
+      
+      let transactions = transactionsResponse.data.transactions
+        .filter(t => !t.deleted)
+        .sort((a, b) => b.date.localeCompare(a.date));
+      
+      // Apply additional date filtering if untilDate is provided
+      if (untilDate) {
+        transactions = transactions.filter(t => t.date <= untilDate);
+      }
+      
+      // Apply limit
+      transactions = transactions.slice(0, limit);
+      
+      // Helper functions
+      const formatAmount = (amount: number) => {
+        const value = amount / 1000;
+        return value >= 0 ? `+$${value.toFixed(2)}` : `-$${Math.abs(value).toFixed(2)}`;
+      };
+      
+      const formatDate = (dateStr: string) => {
+        const date = new Date(dateStr);
+        return date.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+      };
+      
+      const formatStatus = (clearedStatus: string, approvedStatus: boolean) => {
+        const clearedText = clearedStatus.charAt(0).toUpperCase() + clearedStatus.slice(1);
+        const approvedText = approvedStatus ? '✓ Approved' : '⚠️ Unapproved';
+        return `${clearedText}, ${approvedText}`;
+      };
+      
+      const getStatusEmoji = (clearedStatus: string, approvedStatus: boolean) => {
+        if (clearedStatus === 'reconciled') return '✅';
+        if (clearedStatus === 'cleared' && approvedStatus) return '🟢';
+        if (clearedStatus === 'cleared' && !approvedStatus) return '🟡';
+        if (clearedStatus === 'uncleared' && approvedStatus) return '🔵';
+        return '🔴'; // uncleared and unapproved
+      };
+      
+      let content = `# Transactions for Reconciliation\n\n`;
+      
+      // Build filter description
+      const filters = [];
+      if (accountId) {
+        // Get account name for display
+        try {
+          const accountResponse = await client.getAccount(actualBudgetId, accountId);
+          filters.push(`Account: ${accountResponse.data.account.name}`);
+        } catch {
+          filters.push(`Account ID: ${accountId}`);
+        }
+      }
+      if (cleared) filters.push(`Cleared Status: ${cleared}`);
+      if (approved !== undefined) filters.push(`Approved: ${approved ? 'Yes' : 'No'}`);
+      if (sinceDate) filters.push(`From: ${formatDate(sinceDate)}`);
+      if (untilDate) filters.push(`Until: ${formatDate(untilDate)}`);
+      
+      content += `## Search Criteria\n`;
+      if (filters.length > 0) {
+        content += filters.map(f => `- ${f}`).join('\n') + '\n';
+      } else {
+        content += `- All transactions\n`;
+      }
+      content += `- Limit: ${limit} transactions\n\n`;
+      
+      content += `## Summary\n`;
+      content += `- **Total Transactions Found**: ${transactions.length}\n`;
+      
+      if (transactions.length === 0) {
+        content += `\nNo transactions found matching the specified criteria.\n`;
+        return {
+          content: [{ type: "text", text: content }]
+        };
+      }
+      
+      // Calculate summary statistics
+      const statusCounts = {
+        uncleared_unapproved: 0,
+        uncleared_approved: 0,
+        cleared_unapproved: 0,
+        cleared_approved: 0,
+        reconciled: 0
+      };
+      
+      let totalAmount = 0;
+      
+      for (const t of transactions) {
+        totalAmount += t.amount;
+        
+        if (t.cleared === 'reconciled') {
+          statusCounts.reconciled++;
+        } else if (t.cleared === 'cleared') {
+          if (t.approved) statusCounts.cleared_approved++;
+          else statusCounts.cleared_unapproved++;
+        } else { // uncleared
+          if (t.approved) statusCounts.uncleared_approved++;
+          else statusCounts.uncleared_unapproved++;
+        }
+      }
+      
+      content += `- **Net Amount**: ${formatAmount(totalAmount)}\n\n`;
+      
+      content += `### Status Breakdown\n`;
+      if (statusCounts.uncleared_unapproved > 0) content += `- 🔴 **Uncleared & Unapproved**: ${statusCounts.uncleared_unapproved}\n`;
+      if (statusCounts.uncleared_approved > 0) content += `- 🔵 **Uncleared & Approved**: ${statusCounts.uncleared_approved}\n`;
+      if (statusCounts.cleared_unapproved > 0) content += `- 🟡 **Cleared & Unapproved**: ${statusCounts.cleared_unapproved}\n`;
+      if (statusCounts.cleared_approved > 0) content += `- 🟢 **Cleared & Approved**: ${statusCounts.cleared_approved}\n`;
+      if (statusCounts.reconciled > 0) content += `- ✅ **Reconciled**: ${statusCounts.reconciled}\n`;
+      
+      content += `\n## Transactions\n\n`;
+      
+      // Group transactions by month for better readability
+      const transactionsByMonth = new Map<string, typeof transactions>();
+      
+      for (const transaction of transactions) {
+        const monthKey = transaction.date.substring(0, 7); // YYYY-MM
+        if (!transactionsByMonth.has(monthKey)) {
+          transactionsByMonth.set(monthKey, []);
+        }
+        transactionsByMonth.get(monthKey)!.push(transaction);
+      }
+      
+      // Sort months in descending order
+      const sortedMonths = Array.from(transactionsByMonth.keys()).sort().reverse();
+      
+      for (const month of sortedMonths) {
+        const monthTransactions = transactionsByMonth.get(month)!;
+        const monthDate = new Date(month + '-01');
+        content += `### ${monthDate.toLocaleDateString('en-US', { year: 'numeric', month: 'long' })}\n\n`;
+        
+        for (const t of monthTransactions) {
+          const statusEmoji = getStatusEmoji(t.cleared, t.approved);
+          content += `${statusEmoji} **${formatDate(t.date)}** - ${t.payee_name || 'No Payee'}\n`;
+          content += `   - **Amount**: ${formatAmount(t.amount)}\n`;
+          content += `   - **Account**: ${t.account_name}\n`;
+          content += `   - **Status**: ${formatStatus(t.cleared, t.approved)}\n`;
+          content += `   - **Category**: ${t.category_name || 'Uncategorized'}\n`;
+          content += `   - **ID**: ${t.id}\n`;
+          if (t.memo) {
+            content += `   - **Memo**: ${t.memo}\n`;
+          }
+          content += `\n`;
+        }
+      }
+      
+      content += `## Reconciliation Actions\n`;
+      content += `- Use \`bulk-update-transaction-status\` to update multiple transactions at once\n`;
+      content += `- Use \`reconcile-account-transactions\` to reconcile an entire account through a specific date\n`;
+      content += `- Use \`mark-transactions-cleared\` to mark specific transactions as cleared\n`;
+      
+      return {
+        content: [{ type: "text", text: content }]
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error: ${error instanceof Error ? error.message : String(error)}` }],
+        isError: true
+      };
+    }
+  }
+);
+
+// Tool: Mark Transactions as Cleared
+server.registerTool(
+  "mark-transactions-cleared",
+  {
+    title: "Mark Transactions as Cleared",
+    description: "Update transactions from uncleared to cleared status for reconciliation",
+    inputSchema: {
+      budgetId: z.string().describe("Budget ID (use 'last-used' for last used budget)"),
+      transactionIds: z.array(z.string()).describe("Array of transaction IDs to mark as cleared"),
+      alsoApprove: z.boolean().optional().describe("Also mark transactions as approved (default: true)")
+    }
+  },
+  async ({ budgetId, transactionIds, alsoApprove = true }) => {
+    try {
+      const client = getYNABClient();
+      
+      // If budgetId is "last-used", get the default budget
+      let actualBudgetId = budgetId;
+      if (budgetId === "last-used") {
+        const budgets = await client.getBudgets();
+        if (budgets.data.default_budget) {
+          actualBudgetId = budgets.data.default_budget.id;
+        } else {
+          throw new Error("No default budget found");
+        }
+      }
+      
+      // Prepare bulk updates to mark as cleared (and optionally approved)
+      const bulkUpdates = transactionIds.map(id => ({
+        transactionId: id,
+        cleared: 'cleared' as const,
+        approved: alsoApprove
+      }));
+      
+      // Perform bulk update
+      const results = await client.bulkUpdateTransactionStatus(actualBudgetId, bulkUpdates);
+      
+      // Helper functions
+      const formatAmount = (amount: number) => {
+        const value = amount / 1000;
+        return value >= 0 ? `+$${value.toFixed(2)}` : `-$${Math.abs(value).toFixed(2)}`;
+      };
+      
+      const formatDate = (dateStr: string) => {
+        const date = new Date(dateStr);
+        return date.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+      };
+      
+      let content = `# Mark Transactions as Cleared - Complete\n\n`;
+      content += `## Summary\n`;
+      content += `- **Total Transactions Requested**: ${transactionIds.length}\n`;
+      content += `- **Successfully Updated**: ${results.length}\n`;
+      content += `- **Failed Updates**: ${transactionIds.length - results.length}\n`;
+      content += `- **New Status**: Cleared${alsoApprove ? ' & Approved' : ''}\n\n`;
+      
+      if (results.length > 0) {
+        content += `## Updated Transactions\n\n`;
+        
+        // Calculate total amount cleared
+        const totalAmountCleared = results.reduce((sum, result) => sum + result.data.transaction.amount, 0);
+        content += `**Total Amount Cleared**: ${formatAmount(totalAmountCleared)}\n\n`;
+        
+        // Group transactions by account for better organization
+        const transactionsByAccount = new Map<string, typeof results>();
+        
+        for (const result of results) {
+          const accountName = result.data.transaction.account_name || 'Unknown Account';
+          if (!transactionsByAccount.has(accountName)) {
+            transactionsByAccount.set(accountName, []);
+          }
+          transactionsByAccount.get(accountName)!.push(result);
+        }
+        
+        // Sort accounts alphabetically
+        const sortedAccounts = Array.from(transactionsByAccount.keys()).sort();
+        
+        for (const accountName of sortedAccounts) {
+          const accountTransactions = transactionsByAccount.get(accountName)!;
+          content += `### ${accountName}\n\n`;
+          
+          // Sort transactions by date (newest first)
+          accountTransactions.sort((a, b) => b.data.transaction.date.localeCompare(a.data.transaction.date));
+          
+          for (const result of accountTransactions) {
+            const t = result.data.transaction;
+            content += `- **${formatDate(t.date)}** - ${t.payee_name || 'No Payee'}\n`;
+            content += `  - Amount: ${formatAmount(t.amount)}\n`;
+            content += `  - Category: ${t.category_name || 'Uncategorized'}\n`;
+            content += `  - Status: ✅ Cleared${t.approved ? ', ✓ Approved' : ''}\n`;
+            content += `  - ID: ${t.id}\n`;
+            if (t.memo) {
+              content += `  - Memo: ${t.memo}\n`;
+            }
+            content += `\n`;
+          }
+        }
+      }
+      
+      if (transactionIds.length - results.length > 0) {
+        content += `## Failed Updates\n`;
+        content += `${transactionIds.length - results.length} transaction(s) could not be updated.\n`;
+        content += `This may be due to:\n`;
+        content += `- Invalid transaction IDs\n`;
+        content += `- Network connectivity issues\n`;
+        content += `- Transactions that are already deleted\n`;
+        content += `- API rate limiting\n\n`;
+      }
+      
+      content += `## Balance Impact\n`;
+      if (results.length > 0) {
+        const totalAmount = results.reduce((sum, result) => sum + result.data.transaction.amount, 0);
+        content += `These cleared transactions represent ${formatAmount(totalAmount)} in activity.\n`;
+        content += `Your account's cleared balance will reflect these transactions.\n\n`;
+      }
+      
+      content += `## Next Steps\n`;
+      content += `- Review your account balances to ensure they match your bank statements\n`;
+      content += `- Use \`reconcile-account-transactions\` to mark these as reconciled when ready\n`;
+      content += `- Use \`find-transactions-for-reconciliation\` to find remaining uncleared transactions\n`;
+      
+      return {
+        content: [{ type: "text", text: content }]
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error: ${error instanceof Error ? error.message : String(error)}` }],
+        isError: true
+      };
+    }
+  }
+);
+
+// Tool: Reconciliation Status Report
+server.registerTool(
+  "reconciliation-status-report",
+  {
+    title: "Generate Reconciliation Status Report",
+    description: "Generate a comprehensive report showing the current reconciliation state of accounts",
+    inputSchema: {
+      budgetId: z.string().describe("Budget ID (use 'last-used' for last used budget)"),
+      accountIds: z.array(z.string()).optional().describe("Array of account IDs to include (optional - if not provided, includes all accounts)"),
+      includeReconciledTransactions: z.boolean().optional().describe("Include details of already reconciled transactions (default: false)")
+    }
+  },
+  async ({ budgetId, accountIds, includeReconciledTransactions = false }) => {
+    try {
+      const client = getYNABClient();
+      
+      // If budgetId is "last-used", get the default budget
+      let actualBudgetId = budgetId;
+      if (budgetId === "last-used") {
+        const budgets = await client.getBudgets();
+        if (budgets.data.default_budget) {
+          actualBudgetId = budgets.data.default_budget.id;
+        } else {
+          throw new Error("No default budget found");
+        }
+      }
+      
+      // Get all accounts
+      const accountsResponse = await client.getAccounts(actualBudgetId);
+      let accounts = accountsResponse.data.accounts.filter(a => !a.closed && !a.deleted);
+      
+      // Filter by specified account IDs if provided
+      if (accountIds && accountIds.length > 0) {
+        accounts = accounts.filter(a => accountIds.includes(a.id));
+      }
+      
+      if (accounts.length === 0) {
+        return {
+          content: [{ type: "text", text: "No accounts found matching the specified criteria." }]
+        };
+      }
+      
+      // Helper functions
+      const formatAmount = (amount: number) => {
+        return (amount / 1000).toFixed(2);
+      };
+      
+      const formatDate = (dateStr: string) => {
+        const date = new Date(dateStr);
+        return date.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+      };
+      
+      let content = `# Reconciliation Status Report\n\n`;
+      content += `## Overview\n`;
+      content += `- **Report Date**: ${formatDate(new Date().toISOString().split('T')[0])}\n`;
+      content += `- **Accounts Included**: ${accounts.length}\n`;
+      content += `- **Budget**: ${actualBudgetId === budgetId ? budgetId : `${budgetId} (${actualBudgetId})`}\n\n`;
+      
+      // Collect summary statistics
+      let totalAccounts = 0;
+      let totalUncleared = 0;
+      let totalCleared = 0;
+      let totalReconciled = 0;
+      let totalUnapproved = 0;
+      let totalUnprocessedBalance = 0;
+      
+      const accountReports: Array<{
+        account: any;
+        transactions: any[];
+        summary: any;
+      }> = [];
+      
+      // Process each account
+      for (const account of accounts) {
+        try {
+          const transactionsResponse = await client.getAccountTransactions(actualBudgetId, account.id);
+          const transactions = transactionsResponse.data.transactions.filter(t => !t.deleted);
+          
+          // Calculate statistics for this account
+          const statusCounts = {
+            uncleared: 0,
+            cleared: 0,
+            reconciled: 0,
+            unapproved: 0
+          };
+          
+          const statusBalances = {
+            uncleared: 0,
+            cleared: 0,
+            reconciled: 0
+          };
+          
+          let lastReconciledDate: string | null = null;
+          
+          for (const t of transactions) {
+            // Count by status
+            statusCounts[t.cleared]++;
+            statusBalances[t.cleared] += t.amount;
+            
+            if (!t.approved) {
+              statusCounts.unapproved++;
+            }
+            
+            // Track last reconciled date
+            if (t.cleared === 'reconciled') {
+              if (!lastReconciledDate || t.date > lastReconciledDate) {
+                lastReconciledDate = t.date;
+              }
+            }
+          }
+          
+          const accountSummary = {
+            account_id: account.id,
+            account_name: account.name,
+            uncleared_count: statusCounts.uncleared,
+            cleared_count: statusCounts.cleared,
+            reconciled_count: statusCounts.reconciled,
+            unapproved_count: statusCounts.unapproved,
+            uncleared_balance: statusBalances.uncleared,
+            cleared_balance: statusBalances.cleared,
+            reconciled_balance: statusBalances.reconciled,
+            total_balance: account.balance,
+            last_reconciled_date: lastReconciledDate
+          };
+          
+          accountReports.push({
+            account,
+            transactions,
+            summary: accountSummary
+          });
+          
+          // Add to totals
+          totalAccounts++;
+          totalUncleared += statusCounts.uncleared;
+          totalCleared += statusCounts.cleared;
+          totalReconciled += statusCounts.reconciled;
+          totalUnapproved += statusCounts.unapproved;
+          totalUnprocessedBalance += statusBalances.uncleared;
+          
+        } catch (error) {
+          console.error(`Error processing account ${account.name}:`, error);
+        }
+      }
+      
+      // Overall summary
+      content += `## Summary Statistics\n`;
+      content += `- **Total Transactions Needing Attention**: ${totalUncleared + totalUnapproved}\n`;
+      content += `- **Uncleared Transactions**: ${totalUncleared}\n`;
+      content += `- **Cleared Transactions**: ${totalCleared}\n`;
+      content += `- **Reconciled Transactions**: ${totalReconciled}\n`;
+      content += `- **Unapproved Transactions**: ${totalUnapproved}\n`;
+      content += `- **Unprocessed Balance**: $${formatAmount(totalUnprocessedBalance)}\n\n`;
+      
+      // Account-by-account breakdown
+      content += `## Account Details\n\n`;
+      
+      // Sort accounts by the number of uncleared transactions (most needing attention first)
+      accountReports.sort((a, b) => b.summary.uncleared_count - a.summary.uncleared_count);
+      
+      for (const report of accountReports) {
+        const { account, transactions, summary } = report;
+        
+        // Get urgency level
+        const getUrgencyEmoji = () => {
+          if (summary.uncleared_count > 10) return '🔴';
+          if (summary.uncleared_count > 5) return '🟡';
+          if (summary.uncleared_count > 0) return '🔵';
+          return '✅';
+        };
+        
+        content += `### ${getUrgencyEmoji()} ${account.name}\n\n`;
+        content += `**Account Balance**: $${formatAmount(account.balance)}\n`;
+        content += `**Account Type**: ${account.type}\n\n`;
+        
+        content += `**Transaction Status:**\n`;
+        content += `- 🔴 Uncleared: ${summary.uncleared_count} ($${formatAmount(summary.uncleared_balance)})\n`;
+        content += `- 🟡 Cleared: ${summary.cleared_count} ($${formatAmount(summary.cleared_balance)})\n`;
+        content += `- ✅ Reconciled: ${summary.reconciled_count} ($${formatAmount(summary.reconciled_balance)})\n`;
+        content += `- ⚠️ Unapproved: ${summary.unapproved_count}\n`;
+        
+        if (summary.last_reconciled_date) {
+          content += `- **Last Reconciled**: ${formatDate(summary.last_reconciled_date)}\n`;
+        } else {
+          content += `- **Last Reconciled**: Never\n`;
+        }
+        
+        // Recommendations
+        content += `\n**Recommendations:**\n`;
+        if (summary.uncleared_count > 0) {
+          content += `- Use \`find-transactions-for-reconciliation\` to review ${summary.uncleared_count} uncleared transactions\n`;
+          content += `- Use \`mark-transactions-cleared\` to mark verified transactions as cleared\n`;
+        }
+        if (summary.cleared_count > 0) {
+          content += `- Consider using \`reconcile-account-transactions\` to reconcile ${summary.cleared_count} cleared transactions\n`;
+        }
+        if (summary.unapproved_count > 0) {
+          content += `- Review and approve ${summary.unapproved_count} unapproved transactions\n`;
+        }
+        if (summary.uncleared_count === 0 && summary.cleared_count === 0) {
+          content += `- ✅ Account is fully reconciled!\n`;
+        }
+        
+        content += `\n`;
+        
+        // Show recent uncleared transactions if requested
+        if (summary.uncleared_count > 0 && summary.uncleared_count <= 5) {
+          const unclearedTransactions = transactions
+            .filter(t => t.cleared === 'uncleared')
+            .sort((a, b) => b.date.localeCompare(a.date))
+            .slice(0, 5);
+          
+          content += `**Recent Uncleared Transactions:**\n`;
+          for (const t of unclearedTransactions) {
+            content += `- ${formatDate(t.date)} - ${t.payee_name || 'No Payee'} - $${formatAmount(t.amount)}\n`;
+          }
+          content += `\n`;
+        }
+      }
+      
+      // Reconciliation workflow guidance
+      content += `## Recommended Reconciliation Workflow\n\n`;
+      content += `1. **Review Uncleared Transactions**: Use \`find-transactions-for-reconciliation\` with \`cleared: "uncleared"\`\n`;
+      content += `2. **Mark Verified Transactions**: Use \`mark-transactions-cleared\` for transactions that appear on your bank statement\n`;
+      content += `3. **Reconcile Account**: Use \`reconcile-account-transactions\` when you have a complete bank statement\n`;
+      content += `4. **Approve Transactions**: Ensure all transactions are approved for accurate reporting\n`;
+      content += `5. **Regular Schedule**: Reconcile at least monthly, ideally weekly for active accounts\n\n`;
+      
+      content += `## Quick Actions\n`;
+      content += `- **Find all uncleared**: \`find-transactions-for-reconciliation\` with \`cleared: "uncleared"\`\n`;
+      content += `- **Find unapproved**: \`find-transactions-for-reconciliation\` with \`approved: false\`\n`;
+      content += `- **Bulk clear transactions**: \`mark-transactions-cleared\` with transaction IDs\n`;
+      content += `- **Full account reconciliation**: \`reconcile-account-transactions\` with account ID and date\n`;
+      
+      return {
+        content: [{ type: "text", text: content }]
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error: ${error instanceof Error ? error.message : String(error)}` }],
+        isError: true
+      };
+    }
+  }
+);
+
 // Prompt: Budget Analysis
 server.registerPrompt(
   "analyze-budget",
@@ -2476,6 +3290,11 @@ async function main() {
   console.error("  - create-transaction");
   console.error("  - update-transaction");
   console.error("  - delete-transaction");
+  console.error("  - bulk-update-transaction-status");
+  console.error("  - reconcile-account-transactions");
+  console.error("  - find-transactions-for-reconciliation");
+  console.error("  - mark-transactions-cleared");
+  console.error("  - reconciliation-status-report");
   console.error("\nAvailable prompts:");
   console.error("  - analyze-budget");
 }

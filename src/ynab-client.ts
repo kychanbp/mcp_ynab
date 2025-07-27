@@ -190,4 +190,62 @@ export class YNABClient {
       method: 'DELETE'
     });
   }
+
+  // Reconciliation methods
+  async updateTransactionStatus(budgetId: string, transactionId: string, cleared?: 'cleared' | 'uncleared' | 'reconciled', approved?: boolean): Promise<TransactionResponse> {
+    const transaction: any = {};
+    if (cleared !== undefined) transaction.cleared = cleared;
+    if (approved !== undefined) transaction.approved = approved;
+    
+    return this.request<TransactionResponse>(`/budgets/${budgetId}/transactions/${transactionId}`, {
+      method: 'PUT',
+      body: JSON.stringify({ transaction })
+    });
+  }
+
+  async getTransactionsByStatus(budgetId: string, accountId?: string, cleared?: 'cleared' | 'uncleared' | 'reconciled', approved?: boolean, params?: { since_date?: string; last_knowledge_of_server?: number }): Promise<TransactionsResponse> {
+    // Get all transactions and filter by status
+    let response: TransactionsResponse;
+    
+    if (accountId) {
+      response = await this.getAccountTransactions(budgetId, accountId, params);
+    } else {
+      response = await this.getTransactions(budgetId, params);
+    }
+    
+    // Filter transactions based on status criteria
+    let filteredTransactions = response.data.transactions;
+    
+    if (cleared !== undefined) {
+      filteredTransactions = filteredTransactions.filter(t => t.cleared === cleared);
+    }
+    
+    if (approved !== undefined) {
+      filteredTransactions = filteredTransactions.filter(t => t.approved === approved);
+    }
+    
+    return {
+      data: {
+        transactions: filteredTransactions,
+        server_knowledge: response.data.server_knowledge
+      }
+    };
+  }
+
+  async bulkUpdateTransactionStatus(budgetId: string, updates: Array<{transactionId: string, cleared?: 'cleared' | 'uncleared' | 'reconciled', approved?: boolean}>): Promise<Array<TransactionResponse>> {
+    const results: TransactionResponse[] = [];
+    
+    // Process updates sequentially to avoid rate limiting
+    for (const update of updates) {
+      try {
+        const result = await this.updateTransactionStatus(budgetId, update.transactionId, update.cleared, update.approved);
+        results.push(result);
+      } catch (error) {
+        // Continue with other updates even if one fails
+        console.error(`Failed to update transaction ${update.transactionId}:`, error);
+      }
+    }
+    
+    return results;
+  }
 } 

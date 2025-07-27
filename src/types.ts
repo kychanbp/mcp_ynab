@@ -356,4 +356,51 @@ export interface TransactionsImportResponse {
   data: {
     transaction_ids: string[];
   };
+}
+
+// Reconciliation Types
+export interface TransactionStatusUpdate {
+  transaction_id: string;
+  current_cleared: 'cleared' | 'uncleared' | 'reconciled';
+  new_cleared?: 'cleared' | 'uncleared' | 'reconciled';
+  current_approved: boolean;
+  new_approved?: boolean;
+}
+
+export interface BulkTransactionStatusUpdate {
+  transaction_id: string;
+  cleared?: 'cleared' | 'uncleared' | 'reconciled';
+  approved?: boolean;
+}
+
+export interface ReconciliationStatus {
+  account_id: string;
+  account_name: string;
+  uncleared_count: number;
+  cleared_count: number;
+  reconciled_count: number;
+  unapproved_count: number;
+  uncleared_balance: number;
+  cleared_balance: number;
+  reconciled_balance: number;
+  total_balance: number;
+  last_reconciled_date?: string;
+}
+
+export interface ReconciliationSummary {
+  account_id: string;
+  account_name: string;
+  reconciliation_date: string;
+  transactions_reconciled: number;
+  total_amount_reconciled: number;
+  new_reconciled_balance: number;
+  transactions_updated: TransactionStatusUpdate[];
+}
+
+export interface BulkUpdateTransactionWrapper {
+  transactions: Array<{
+    id: string;
+    cleared?: 'cleared' | 'uncleared' | 'reconciled';
+    approved?: boolean;
+  }>;
 } 

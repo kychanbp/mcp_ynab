@@ -152,8 +152,79 @@ A Model Context Protocol (MCP) server that provides access to YNAB (You Need A B
   - `transactionId` (string) - Transaction ID to delete
 - **Output**: Confirmation of deletion with transaction summary
 
+#### Reconciliation Tools
+
+**bulk-update-transaction-status**
+- **Input**: 
+  - `budgetId` (string) - Budget ID or 'last-used'
+  - `updates` (array) - Array of transaction updates with:
+    - `transactionId` (string) - Transaction ID to update
+    - `cleared` (optional enum: 'cleared', 'uncleared', 'reconciled') - New cleared status
+    - `approved` (optional boolean) - New approved status
+- **Output**: Summary of successful and failed updates with transaction details
+
+**reconcile-account-transactions**
+- **Input**: 
+  - `budgetId` (string) - Budget ID or 'last-used'
+  - `accountId` (string) - Account ID to reconcile
+  - `reconciliationDate` (string) - Reconciliation date (ISO format: YYYY-MM-DD)
+  - `endingBalance` (optional number) - Expected ending balance in dollars for verification
+- **Output**: Comprehensive reconciliation report with balance verification and transaction summary
+
+**find-transactions-for-reconciliation**
+- **Input**: 
+  - `budgetId` (string) - Budget ID or 'last-used'
+  - `accountId` (optional string) - Account ID to filter by
+  - `cleared` (optional enum: 'cleared', 'uncleared', 'reconciled') - Filter by cleared status
+  - `approved` (optional boolean) - Filter by approved status
+  - `sinceDate` (optional string) - Only include transactions on or after this date
+  - `untilDate` (optional string) - Only include transactions on or before this date
+  - `limit` (optional number) - Maximum number of transactions to return (default: 50)
+- **Output**: Filtered list of transactions with status breakdown and reconciliation guidance
+
+**mark-transactions-cleared**
+- **Input**: 
+  - `budgetId` (string) - Budget ID or 'last-used'
+  - `transactionIds` (array of strings) - Transaction IDs to mark as cleared
+  - `alsoApprove` (optional boolean) - Also mark transactions as approved (default: true)
+- **Output**: Summary of cleared transactions with balance impact and next steps
+
+**reconciliation-status-report**
+- **Input**: 
+  - `budgetId` (string) - Budget ID or 'last-used'
+  - `accountIds` (optional array of strings) - Account IDs to include (default: all accounts)
+  - `includeReconciledTransactions` (optional boolean) - Include reconciled transaction details (default: false)
+- **Output**: Comprehensive reconciliation status report with account-by-account breakdown, recommendations, and workflow guidance
+
 ### Prompts
 - **analyze-budget** - Analyze a YNAB budget and provide insights
+
+## Reconciliation Workflows
+
+The reconciliation tools support common workflows for keeping your YNAB data synchronized with your bank statements:
+
+### Daily/Weekly Reconciliation
+1. Use `find-transactions-for-reconciliation` with `cleared: "uncleared"` to find new transactions
+2. Verify transactions against your bank account or credit card activity
+3. Use `mark-transactions-cleared` to mark verified transactions as cleared
+4. Use `reconciliation-status-report` to check overall account status
+
+### Monthly Reconciliation (Bank Statement)
+1. Use `reconciliation-status-report` to see which accounts need reconciliation
+2. Use `find-transactions-for-reconciliation` to review cleared but not reconciled transactions
+3. Use `reconcile-account-transactions` with your statement ending date and balance
+4. Review any discrepancies and resolve them
+
+### Bulk Status Updates
+1. Use `find-transactions-for-reconciliation` to identify transactions needing updates
+2. Use `bulk-update-transaction-status` to update multiple transactions at once
+3. Use `reconciliation-status-report` to verify the changes
+
+### Transaction Status States
+- **Uncleared**: New transactions that haven't been verified against bank records
+- **Cleared**: Transactions that have been verified but not yet reconciled
+- **Reconciled**: Transactions that have been included in a bank statement reconciliation
+- **Approved**: Transactions that have been reviewed and confirmed (independent of cleared status)
 
 ## Output Format Notes
 
@@ -323,6 +394,13 @@ npm test
 - Create transaction: Call `create-transaction` with transaction details
 - Update transaction: Call `update-transaction` with `transactionId` and fields to update
 - Delete transaction: Call `delete-transaction` with `budgetId` and `transactionId`
+
+### Using Reconciliation Tools
+- Get reconciliation status: Call `reconciliation-status-report` with `budgetId`
+- Find uncleared transactions: Call `find-transactions-for-reconciliation` with `budgetId` and `cleared: "uncleared"`
+- Mark transactions as cleared: Call `mark-transactions-cleared` with `budgetId` and array of `transactionIds`
+- Reconcile account: Call `reconcile-account-transactions` with `budgetId`, `accountId`, and `reconciliationDate`
+- Bulk update transaction status: Call `bulk-update-transaction-status` with `budgetId` and array of updates
 
 ### Using Prompts
 - Analyze budget: Use `analyze-budget` prompt to get insights about a budget
