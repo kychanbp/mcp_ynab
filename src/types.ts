@@ -403,4 +403,45 @@ export interface BulkUpdateTransactionWrapper {
     cleared?: 'cleared' | 'uncleared' | 'reconciled';
     approved?: boolean;
   }>;
+}
+
+// Bank Transaction Matching Types
+export interface BankTransaction {
+  date: string;
+  amount: number;
+  payee?: string;
+}
+
+export interface TransactionMatch {
+  bankTransaction: BankTransaction;
+  ynabTransaction: TransactionDetail;
+  matchConfidence: 'exact' | 'high' | 'medium' | 'low';
+  matchReasons: string[];
+}
+
+export interface TransactionMatchResult {
+  matched: TransactionMatch[];
+  unmatchedBank: BankTransaction[];
+  unmatchedYNAB: TransactionDetail[];
+  summary: {
+    totalBankTransactions: number;
+    totalYNABTransactions: number;
+    matchedCount: number;
+    matchRate: number;
+  };
+}
+
+// Reconciliation with Adjustment Types
+export interface ReconciliationResult {
+  account_id: string;
+  account_name: string;
+  reconciliation_date: string;
+  transactions_reconciled: number;
+  starting_balance: number;
+  target_balance: number;
+  actual_balance: number;
+  adjustment_needed: number;
+  adjustment_created: boolean;
+  adjustment_transaction?: TransactionDetail;
+  errors?: string[];
 } 

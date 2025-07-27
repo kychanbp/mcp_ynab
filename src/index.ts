@@ -2,6 +2,7 @@ import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mc
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { YNABClient } from "./ynab-client.js";
+import { UpdateTransaction } from "./types.js";
 
 // Initialize server
 const server = new McpServer({
@@ -2412,13 +2413,29 @@ server.registerTool(
   "bulk-update-transaction-status",
   {
     title: "Bulk Update Transaction Status",
-    description: "Update the cleared and approved status of multiple transactions for reconciliation",
+    description: "Update multiple transactions at once with support for all transaction fields",
     inputSchema: {
       budgetId: z.string().describe("Budget ID (use 'last-used' for last used budget)"),
       updates: z.array(z.object({
         transactionId: z.string().describe("Transaction ID to update"),
+        accountId: z.string().optional().describe("New account ID"),
+        payeeId: z.string().nullable().optional().describe("New payee ID"),
+        payeeName: z.string().nullable().optional().describe("New payee name"),
+        categoryId: z.string().nullable().optional().describe("New category ID"),
+        amount: z.number().optional().describe("New amount in dollars"),
+        memo: z.string().nullable().optional().describe("New memo"),
+        flagColor: z.enum(['red', 'orange', 'yellow', 'green', 'blue', 'purple']).nullable().optional().describe("New flag color"),
         cleared: z.enum(['cleared', 'uncleared', 'reconciled']).optional().describe("New cleared status"),
-        approved: z.boolean().optional().describe("New approved status")
+        approved: z.boolean().optional().describe("New approved status"),
+        date: z.string().optional().describe("New date (ISO format: YYYY-MM-DD)"),
+        importId: z.string().nullable().optional().describe("New import ID"),
+        subtransactions: z.array(z.object({
+          amount: z.number().describe("Subtransaction amount in dollars"),
+          payeeId: z.string().nullable().optional().describe("Subtransaction payee ID"),
+          payeeName: z.string().nullable().optional().describe("Subtransaction payee name"),
+          categoryId: z.string().nullable().optional().describe("Subtransaction category ID"),
+          memo: z.string().nullable().optional().describe("Subtransaction memo")
+        })).optional().describe("New subtransactions (replaces existing)")
       })).describe("Array of transaction updates")
     }
   },
@@ -2437,58 +2454,159 @@ server.registerTool(
         }
       }
       
-      // Prepare updates for bulk operation
-      const bulkUpdates = updates.map(update => ({
-        transactionId: update.transactionId,
-        cleared: update.cleared,
-        approved: update.approved
-      }));
+      // Convert updates to YNAB API format
+      const ynabUpdates: UpdateTransaction[] = updates.map(update => {
+        const updateTransaction: UpdateTransaction = {
+          id: update.transactionId
+        };
+        
+        // Add optional fields if provided
+        if (update.accountId !== undefined) updateTransaction.account_id = update.accountId;
+        if (update.payeeId !== undefined) updateTransaction.payee_id = update.payeeId;
+        if (update.payeeName !== undefined) updateTransaction.payee_name = update.payeeName;
+        if (update.categoryId !== undefined) updateTransaction.category_id = update.categoryId;
+        if (update.amount !== undefined) updateTransaction.amount = Math.round(update.amount * 1000); // Convert to milliunits
+        if (update.memo !== undefined) updateTransaction.memo = update.memo;
+        if (update.flagColor !== undefined) updateTransaction.flag_color = update.flagColor;
+        if (update.cleared !== undefined) updateTransaction.cleared = update.cleared;
+        if (update.approved !== undefined) updateTransaction.approved = update.approved;
+        if (update.date !== undefined) updateTransaction.date = update.date;
+        if (update.importId !== undefined) updateTransaction.import_id = update.importId;
+        
+        // Handle subtransactions
+        if (update.subtransactions !== undefined) {
+          updateTransaction.subtransactions = update.subtransactions.map(sub => ({
+            amount: Math.round(sub.amount * 1000), // Convert to milliunits
+            payee_id: sub.payeeId,
+            payee_name: sub.payeeName,
+            category_id: sub.categoryId,
+            memo: sub.memo
+          }));
+        }
+        
+        return updateTransaction;
+      });
       
-      // Perform bulk update
-      const results = await client.bulkUpdateTransactionStatus(actualBudgetId, bulkUpdates);
+      // Perform bulk update using the PATCH endpoint
+      const response = await client.bulkUpdateTransactions(actualBudgetId, ynabUpdates);
       
-      // Helper function to format status
+      // Helper functions
+      const formatAmount = (amount: number) => {
+        const value = amount / 1000;
+        return value >= 0 ? `+$${value.toFixed(2)}` : `-$${Math.abs(value).toFixed(2)}`;
+      };
+      
+      const formatDate = (dateStr: string) => {
+        const date = new Date(dateStr);
+        return date.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+      };
+      
       const formatStatus = (cleared: string, approved: boolean) => {
         const clearedText = cleared.charAt(0).toUpperCase() + cleared.slice(1);
         const approvedText = approved ? '✓ Approved' : '⚠️ Unapproved';
         return `${clearedText}, ${approvedText}`;
       };
       
-      let content = `# Bulk Transaction Status Update Complete\n\n`;
+      const getFlagEmoji = (color: string | null) => {
+        const flags: { [key: string]: string } = {
+          'red': '🔴',
+          'orange': '🟠',
+          'yellow': '🟡',
+          'green': '🟢',
+          'blue': '🔵',
+          'purple': '🟣'
+        };
+        return color ? flags[color] || '' : '';
+      };
+      
+      let content = `# Bulk Transaction Update Complete\n\n`;
       content += `## Summary\n`;
       content += `- **Total Updates Requested**: ${updates.length}\n`;
-      content += `- **Successful Updates**: ${results.length}\n`;
-      content += `- **Failed Updates**: ${updates.length - results.length}\n\n`;
+      content += `- **Successful Updates**: ${response.data.transactions.length}\n`;
+      content += `- **Failed Updates**: ${updates.length - response.data.transactions.length}\n\n`;
       
-      if (results.length > 0) {
+      if (response.data.transactions.length > 0) {
         content += `## Updated Transactions\n\n`;
         
-        for (let i = 0; i < results.length; i++) {
-          const result = results[i];
-          const update = updates[i];
-          const transaction = result.data.transaction;
+        // Group transactions by what was updated
+        const updatedFields: { [key: string]: number } = {};
+        
+        for (let i = 0; i < response.data.transactions.length; i++) {
+          const transaction = response.data.transactions[i];
+          const update = updates.find(u => u.transactionId === transaction.id);
           
-          content += `### ${transaction.payee_name || 'No Payee'} - ${transaction.date}\n`;
-          content += `- **Amount**: $${(transaction.amount / 1000).toFixed(2)}\n`;
-          content += `- **Status**: ${formatStatus(transaction.cleared, transaction.approved)}\n`;
+          if (!update) continue;
+          
+          // Track which fields were updated
+          Object.keys(update).forEach(key => {
+            if (key !== 'transactionId' && update[key as keyof typeof update] !== undefined) {
+              updatedFields[key] = (updatedFields[key] || 0) + 1;
+            }
+          });
+          
+          const flag = getFlagEmoji(transaction.flag_color || null);
+          content += `### ${transaction.payee_name || 'No Payee'} ${flag}\n`;
+          content += `- **Date**: ${formatDate(transaction.date)}\n`;
+          content += `- **Amount**: ${formatAmount(transaction.amount)}\n`;
           content += `- **Account**: ${transaction.account_name}\n`;
-          content += `- **Transaction ID**: ${transaction.id}\n`;
+          content += `- **Category**: ${transaction.category_name || 'Uncategorized'}\n`;
+          content += `- **Status**: ${formatStatus(transaction.cleared, transaction.approved)}\n`;
+          
+          if (transaction.memo) {
+            content += `- **Memo**: ${transaction.memo}\n`;
+          }
           
           // Show what was updated
-          if (update.cleared) {
-            content += `- **Updated Cleared Status**: ${update.cleared}\n`;
+          content += `- **Updated Fields**:`;
+          const updatesList = [];
+          if (update.accountId !== undefined) updatesList.push('Account');
+          if (update.payeeId !== undefined || update.payeeName !== undefined) updatesList.push('Payee');
+          if (update.categoryId !== undefined) updatesList.push('Category');
+          if (update.amount !== undefined) updatesList.push('Amount');
+          if (update.memo !== undefined) updatesList.push('Memo');
+          if (update.flagColor !== undefined) updatesList.push('Flag');
+          if (update.cleared !== undefined) updatesList.push('Cleared Status');
+          if (update.approved !== undefined) updatesList.push('Approved Status');
+          if (update.date !== undefined) updatesList.push('Date');
+          if (update.subtransactions !== undefined) updatesList.push('Subtransactions');
+          
+          content += ` ${updatesList.join(', ')}\n`;
+          content += `- **Transaction ID**: ${transaction.id}\n`;
+          
+          if (transaction.subtransactions && transaction.subtransactions.length > 0) {
+            content += `- **Split Transaction**:\n`;
+            for (const sub of transaction.subtransactions) {
+              content += `  - ${sub.category_name || 'Uncategorized'}: ${formatAmount(sub.amount)}`;
+              if (sub.memo) content += ` (${sub.memo})`;
+              content += `\n`;
+            }
           }
-          if (update.approved !== undefined) {
-            content += `- **Updated Approved Status**: ${update.approved ? 'Approved' : 'Unapproved'}\n`;
-          }
+          
           content += `\n`;
+        }
+        
+        // Summary of updated fields
+        content += `## Field Update Summary\n`;
+        for (const [field, count] of Object.entries(updatedFields)) {
+          const fieldName = field.replace(/([A-Z])/g, ' $1').replace(/^./, str => str.toUpperCase());
+          content += `- **${fieldName}**: ${count} transaction(s)\n`;
         }
       }
       
-      if (updates.length - results.length > 0) {
-        content += `## Failed Updates\n`;
-        content += `${updates.length - results.length} transaction(s) could not be updated. This may be due to invalid transaction IDs or network issues.\n`;
+      if (updates.length - response.data.transactions.length > 0) {
+        content += `\n## Failed Updates\n`;
+        content += `${updates.length - response.data.transactions.length} transaction(s) could not be updated.\n`;
+        content += `This may be due to:\n`;
+        content += `- Invalid transaction IDs\n`;
+        content += `- Invalid field values (e.g., non-existent account/category/payee IDs)\n`;
+        content += `- Network connectivity issues\n`;
+        content += `- API rate limiting\n`;
       }
+      
+      content += `\n## Next Steps\n`;
+      content += `- Use \`list-transactions\` to verify the updates\n`;
+      content += `- Use \`get-transaction-details\` to see full details of updated transactions\n`;
+      content += `- Use \`reconciliation-status-report\` if you updated cleared/approved statuses\n`;
       
       return {
         content: [{ type: "text", text: content }]
@@ -3221,6 +3339,347 @@ server.registerTool(
   }
 );
 
+// Tool: Match Bank Transactions
+server.registerTool(
+  "match-bank-transactions",
+  {
+    title: "Match Bank Transactions",
+    description: "Compare bank transactions with YNAB to find matches and discrepancies",
+    inputSchema: {
+      budgetId: z.string().describe("Budget ID (use 'last-used' for last used budget)"),
+      accountId: z.string().describe("Account ID to match transactions for"),
+      bankTransactions: z.array(z.object({
+        date: z.string().describe("Transaction date (ISO format: YYYY-MM-DD)"),
+        amount: z.number().describe("Transaction amount in dollars (negative for outflows)"),
+        payee: z.string().optional().describe("Transaction payee/description")
+      })).describe("Array of bank transactions to match"),
+      tolerance: z.number().default(3).describe("Date range tolerance in days for matching")
+    }
+  },
+  async ({ budgetId, accountId, bankTransactions, tolerance }) => {
+    try {
+      const client = getYNABClient();
+      
+      // If budgetId is "last-used", get the default budget
+      let actualBudgetId = budgetId;
+      if (budgetId === "last-used") {
+        const budgets = await client.getBudgets();
+        if (budgets.data.default_budget) {
+          actualBudgetId = budgets.data.default_budget.id;
+        } else {
+          throw new Error("No default budget found");
+        }
+      }
+      
+      // Perform the matching
+      const matchResult = await client.matchBankTransactions(
+        actualBudgetId,
+        accountId,
+        bankTransactions,
+        tolerance
+      );
+      
+      // Helper functions for formatting
+      const formatAmount = (amount: number) => {
+        const value = typeof amount === 'number' && amount > 1000 ? amount / 1000 : amount;
+        return value >= 0 ? `+$${value.toFixed(2)}` : `-$${Math.abs(value).toFixed(2)}`;
+      };
+      
+      const formatDate = (dateStr: string) => {
+        const date = new Date(dateStr);
+        return date.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+      };
+      
+      const getConfidenceEmoji = (confidence: string) => {
+        const emojis: { [key: string]: string } = {
+          'exact': '✅',
+          'high': '🟢',
+          'medium': '🟡',
+          'low': '🔴'
+        };
+        return emojis[confidence] || '❓';
+      };
+      
+      let content = `# Bank Transaction Matching Results\n\n`;
+      
+      // Summary section
+      content += `## Summary\n`;
+      content += `- **Bank Transactions**: ${matchResult.summary.totalBankTransactions}\n`;
+      content += `- **YNAB Transactions**: ${matchResult.summary.totalYNABTransactions}\n`;
+      content += `- **Matched**: ${matchResult.summary.matchedCount} (${(matchResult.summary.matchRate * 100).toFixed(1)}%)\n`;
+      content += `- **Unmatched Bank**: ${matchResult.unmatchedBank.length}\n`;
+      content += `- **Unmatched YNAB**: ${matchResult.unmatchedYNAB.length}\n\n`;
+      
+      // Matched transactions
+      if (matchResult.matched.length > 0) {
+        content += `## Matched Transactions\n\n`;
+        
+        // Group by confidence level
+        const groupedMatches = matchResult.matched.reduce((acc, match) => {
+          if (!acc[match.matchConfidence]) {
+            acc[match.matchConfidence] = [];
+          }
+          acc[match.matchConfidence].push(match);
+          return acc;
+        }, {} as { [key: string]: typeof matchResult.matched });
+        
+        // Display in order of confidence
+        const confidenceOrder = ['exact', 'high', 'medium', 'low'];
+        for (const confidence of confidenceOrder) {
+          const matches = groupedMatches[confidence];
+          if (!matches || matches.length === 0) continue;
+          
+          content += `### ${getConfidenceEmoji(confidence)} ${confidence.charAt(0).toUpperCase() + confidence.slice(1)} Confidence (${matches.length})\n\n`;
+          
+          for (const match of matches) {
+            const bankTx = match.bankTransaction;
+            const ynabTx = match.ynabTransaction;
+            
+            content += `**${formatDate(bankTx.date)} - ${bankTx.payee || 'No Description'}**\n`;
+            content += `- Bank: ${formatAmount(bankTx.amount)} on ${formatDate(bankTx.date)}\n`;
+            content += `- YNAB: ${formatAmount(ynabTx.amount)} on ${formatDate(ynabTx.date)} - ${ynabTx.payee_name || 'No Payee'}\n`;
+            content += `- Category: ${ynabTx.category_name || 'Uncategorized'}\n`;
+            content += `- Match Reasons: ${match.matchReasons.join(', ')}\n`;
+            content += `- Transaction ID: ${ynabTx.id}\n\n`;
+          }
+        }
+      }
+      
+      // Unmatched bank transactions
+      if (matchResult.unmatchedBank.length > 0) {
+        content += `## ❌ Unmatched Bank Transactions (${matchResult.unmatchedBank.length})\n`;
+        content += `These transactions appear in your bank but not in YNAB:\n\n`;
+        
+        const sortedUnmatchedBank = [...matchResult.unmatchedBank].sort((a, b) => 
+          new Date(b.date).getTime() - new Date(a.date).getTime()
+        );
+        
+        for (const bankTx of sortedUnmatchedBank) {
+          content += `- **${formatDate(bankTx.date)}** - ${bankTx.payee || 'No Description'} - ${formatAmount(bankTx.amount)}\n`;
+        }
+        
+        content += `\n### Recommended Actions:\n`;
+        content += `1. Check if these transactions need to be imported into YNAB\n`;
+        content += `2. Verify the date range - transactions might be outside the search window\n`;
+        content += `3. Check if amounts might be slightly different due to fees or tips\n\n`;
+      }
+      
+      // Unmatched YNAB transactions
+      if (matchResult.unmatchedYNAB.length > 0) {
+        content += `## ⚠️ Unmatched YNAB Transactions (${matchResult.unmatchedYNAB.length})\n`;
+        content += `These transactions appear in YNAB but not in your bank data:\n\n`;
+        
+        const sortedUnmatchedYNAB = [...matchResult.unmatchedYNAB].sort((a, b) => 
+          new Date(b.date).getTime() - new Date(a.date).getTime()
+        );
+        
+        for (const ynabTx of sortedUnmatchedYNAB) {
+          const statusEmoji = ynabTx.cleared === 'cleared' ? '🟡' : 
+                            ynabTx.cleared === 'reconciled' ? '✅' : '🔴';
+          content += `- **${formatDate(ynabTx.date)}** - ${ynabTx.payee_name || 'No Payee'} - ${formatAmount(ynabTx.amount)} ${statusEmoji} ${ynabTx.cleared}\n`;
+          if (ynabTx.memo) {
+            content += `  Memo: ${ynabTx.memo}\n`;
+          }
+        }
+        
+        content += `\n### Possible Reasons:\n`;
+        content += `1. Pending transactions not yet posted to bank\n`;
+        content += `2. Bank data might be incomplete\n`;
+        content += `3. Duplicate entries in YNAB\n`;
+        content += `4. Manual transactions entered incorrectly\n\n`;
+      }
+      
+      // Recommendations
+      content += `## Recommendations\n\n`;
+      
+      if (matchResult.summary.matchRate < 0.8) {
+        content += `⚠️ **Low match rate (${(matchResult.summary.matchRate * 100).toFixed(1)}%)**\n`;
+        content += `- Consider increasing the date tolerance (currently ${tolerance} days)\n`;
+        content += `- Check if bank amounts include fees that YNAB doesn't\n`;
+        content += `- Verify date formats are consistent\n\n`;
+      }
+      
+      if (matchResult.unmatchedBank.length > 0) {
+        content += `📥 **Import Missing Transactions**\n`;
+        content += `- Use \`create-transaction\` to add missing bank transactions\n`;
+        content += `- Consider using YNAB's import feature for bulk additions\n\n`;
+      }
+      
+      if (matchResult.unmatchedYNAB.length > 0) {
+        content += `🔍 **Review YNAB Transactions**\n`;
+        content += `- Check for duplicate entries\n`;
+        content += `- Verify pending transactions\n`;
+        content += `- Update cleared status for matched transactions\n\n`;
+      }
+      
+      content += `## Next Steps\n`;
+      content += `1. Review matched transactions with low confidence\n`;
+      content += `2. Import missing bank transactions using \`create-transaction\`\n`;
+      content += `3. Update transaction statuses using \`bulk-update-transaction-status\`\n`;
+      content += `4. Run \`reconciliation-status-report\` after updates\n`;
+      
+      return {
+        content: [{ type: "text", text: content }]
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error: ${error instanceof Error ? error.message : String(error)}` }],
+        isError: true
+      };
+    }
+  }
+);
+
+// Tool: Reconcile Account with Adjustment
+server.registerTool(
+  "reconcile-account-with-adjustment",
+  {
+    title: "Reconcile Account with Balance Adjustment",
+    description: "Complete one-step reconciliation that marks transactions as reconciled and automatically creates a balance adjustment if needed",
+    inputSchema: {
+      budgetId: z.string().describe("Budget ID (use 'last-used' for last used budget)"),
+      accountId: z.string().describe("Account ID to reconcile"),
+      targetBalance: z.number().describe("Expected ending balance in dollars"),
+      reconciliationDate: z.string().describe("Reconciliation date (ISO format: YYYY-MM-DD)"),
+      createAdjustment: z.boolean().describe("Auto-create adjustment if needed"),
+      adjustmentMemo: z.string().optional().describe("Optional custom memo for adjustment")
+    }
+  },
+  async ({ budgetId, accountId, targetBalance, reconciliationDate, createAdjustment, adjustmentMemo }) => {
+    try {
+      const client = getYNABClient();
+      
+      // If budgetId is "last-used", get the default budget
+      let actualBudgetId = budgetId;
+      if (budgetId === "last-used") {
+        const budgets = await client.getBudgets();
+        if (budgets.data.default_budget) {
+          actualBudgetId = budgets.data.default_budget.id;
+        } else {
+          throw new Error("No default budget found");
+        }
+      }
+      
+      // Perform the reconciliation
+      const result = await client.reconcileAccountWithAdjustment(
+        actualBudgetId,
+        accountId,
+        targetBalance,
+        reconciliationDate,
+        createAdjustment,
+        adjustmentMemo
+      );
+      
+      // Helper functions for formatting
+      const formatAmount = (amount: number) => {
+        const value = amount / 1000;
+        return value >= 0 ? `+$${value.toFixed(2)}` : `-$${Math.abs(value).toFixed(2)}`;
+      };
+      
+      const formatDate = (dateStr: string) => {
+        const date = new Date(dateStr);
+        return date.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+      };
+      
+      let content = `# Account Reconciliation Complete\n\n`;
+      
+      // Account and Date Info
+      content += `## Reconciliation Summary\n`;
+      content += `- **Account**: ${result.account_name}\n`;
+      content += `- **Reconciliation Date**: ${formatDate(result.reconciliation_date)}\n`;
+      content += `- **Transactions Reconciled**: ${result.transactions_reconciled}\n\n`;
+      
+      // Balance Information
+      content += `## Balance Summary\n`;
+      content += `- **Starting Balance**: ${formatAmount(result.starting_balance)}\n`;
+      content += `- **Target Balance**: ${formatAmount(result.target_balance)}\n`;
+      content += `- **Actual Balance**: ${formatAmount(result.actual_balance)}\n`;
+      
+      const difference = result.adjustment_needed;
+      if (difference !== 0) {
+        content += `- **Difference**: ${formatAmount(difference)}`;
+        if (difference > 0) {
+          content += ` (account was under by this amount)\n`;
+        } else {
+          content += ` (account was over by this amount)\n`;
+        }
+      } else {
+        content += `- **Difference**: ✅ Balanced perfectly!\n`;
+      }
+      content += `\n`;
+      
+      // Adjustment Information
+      if (result.adjustment_created && result.adjustment_transaction) {
+        const adj = result.adjustment_transaction;
+        content += `## Balance Adjustment Created\n`;
+        content += `An adjustment transaction was automatically created:\n\n`;
+        content += `- **Amount**: ${formatAmount(adj.amount)}\n`;
+        content += `- **Payee**: ${adj.payee_name || 'Reconciliation Balance Adjustment'}\n`;
+        content += `- **Category**: ${adj.category_name || 'Inflow: Ready to Assign'}\n`;
+        content += `- **Memo**: ${adj.memo || 'Reconciliation adjustment'}\n`;
+        content += `- **Status**: ✅ Reconciled\n`;
+        content += `- **Transaction ID**: ${adj.id}\n\n`;
+      } else if (difference !== 0 && !createAdjustment) {
+        content += `## Balance Adjustment Needed\n`;
+        content += `⚠️ An adjustment of ${formatAmount(difference)} is needed but was not created.\n`;
+        content += `To create the adjustment, run this tool again with \`createAdjustment: true\`\n\n`;
+      }
+      
+      // Errors (if any)
+      if (result.errors && result.errors.length > 0) {
+        content += `## ⚠️ Warnings\n`;
+        for (const error of result.errors) {
+          content += `- ${error}\n`;
+        }
+        content += `\n`;
+      }
+      
+      // Success Status
+      if (result.adjustment_created || difference === 0) {
+        content += `## ✅ Reconciliation Status: Complete\n\n`;
+        content += `Your account has been successfully reconciled`;
+        if (result.adjustment_created) {
+          content += ` with a balance adjustment`;
+        }
+        content += `.\n\n`;
+      } else {
+        content += `## ⚠️ Reconciliation Status: Incomplete\n\n`;
+        content += `Transactions have been marked as reconciled, but the balance doesn't match.\n`;
+        content += `Consider running this tool again with \`createAdjustment: true\` to complete the reconciliation.\n\n`;
+      }
+      
+      // Next Steps
+      content += `## Next Steps\n`;
+      content += `1. Review the reconciliation in YNAB to ensure accuracy\n`;
+      if (result.adjustment_created) {
+        content += `2. The adjustment transaction has been categorized to "Inflow: Ready to Assign"\n`;
+        content += `3. You may want to review your budget categories if adjustments are frequent\n`;
+      }
+      content += `4. Use \`reconciliation-status-report\` to see overall reconciliation status\n`;
+      content += `5. Schedule your next reconciliation (recommended: monthly minimum)\n`;
+      
+      // Tips
+      if (Math.abs(difference) > 10000) { // More than $10
+        content += `\n## 💡 Tip\n`;
+        content += `The adjustment amount was relatively large (${formatAmount(Math.abs(difference))}). `;
+        content += `Consider:\n`;
+        content += `- Checking for missing or duplicate transactions\n`;
+        content += `- Verifying transaction amounts are correct\n`;
+        content += `- Using \`match-bank-transactions\` to compare with your bank statement\n`;
+      }
+      
+      return {
+        content: [{ type: "text", text: content }]
+      };
+    } catch (error) {
+      return {
+        content: [{ type: "text", text: `Error: ${error instanceof Error ? error.message : String(error)}` }],
+        isError: true
+      };
+    }
+  }
+);
+
 // Prompt: Budget Analysis
 server.registerPrompt(
   "analyze-budget",
@@ -3295,6 +3754,8 @@ async function main() {
   console.error("  - find-transactions-for-reconciliation");
   console.error("  - mark-transactions-cleared");
   console.error("  - reconciliation-status-report");
+  console.error("  - match-bank-transactions");
+  console.error("  - reconcile-account-with-adjustment");
   console.error("\nAvailable prompts:");
   console.error("  - analyze-budget");
 }
@@ -3302,4 +3763,4 @@ async function main() {
 main().catch((error) => {
   console.error("Server error:", error);
   process.exit(1);
-}); 
+});

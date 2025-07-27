@@ -159,9 +159,24 @@ A Model Context Protocol (MCP) server that provides access to YNAB (You Need A B
   - `budgetId` (string) - Budget ID or 'last-used'
   - `updates` (array) - Array of transaction updates with:
     - `transactionId` (string) - Transaction ID to update
+    - `accountId` (optional string) - New account ID
+    - `payeeId` (optional string) - New payee ID
+    - `payeeName` (optional string) - New payee name
+    - `categoryId` (optional string) - New category ID
+    - `amount` (optional number) - New amount in dollars
+    - `memo` (optional string) - New memo
+    - `flagColor` (optional enum: 'red', 'orange', 'yellow', 'green', 'blue', 'purple') - New flag color
     - `cleared` (optional enum: 'cleared', 'uncleared', 'reconciled') - New cleared status
     - `approved` (optional boolean) - New approved status
-- **Output**: Summary of successful and failed updates with transaction details
+    - `date` (optional string) - New date (ISO format: YYYY-MM-DD)
+    - `importId` (optional string) - New import ID
+    - `subtransactions` (optional array) - New subtransactions (replaces existing)
+      - `amount` (number) - Subtransaction amount in dollars
+      - `payeeId` (optional string) - Subtransaction payee ID
+      - `payeeName` (optional string) - Subtransaction payee name
+      - `categoryId` (optional string) - Subtransaction category ID
+      - `memo` (optional string) - Subtransaction memo
+- **Output**: Comprehensive update report with transaction details, field update summary, and next steps
 
 **reconcile-account-transactions**
 - **Input**: 
@@ -192,9 +207,44 @@ A Model Context Protocol (MCP) server that provides access to YNAB (You Need A B
 **reconciliation-status-report**
 - **Input**: 
   - `budgetId` (string) - Budget ID or 'last-used'
-  - `accountIds` (optional array of strings) - Account IDs to include (default: all accounts)
-  - `includeReconciledTransactions` (optional boolean) - Include reconciled transaction details (default: false)
-- **Output**: Comprehensive reconciliation status report with account-by-account breakdown, recommendations, and workflow guidance
+  - `accountIds` (optional array of strings) - Specific account IDs to include
+  - `includeReconciledTransactions` (optional boolean) - Include already reconciled transactions
+- **Output**: Comprehensive report with account-by-account reconciliation status, recommendations, and workflow guidance
+
+**match-bank-transactions**
+- **Input**:
+  - `budgetId` (string) - Budget ID or 'last-used'
+  - `accountId` (string) - Account ID to match transactions for
+  - `bankTransactions` (array) - Array of bank transactions with:
+    - `date` (string) - Transaction date (ISO format: YYYY-MM-DD)
+    - `amount` (number) - Transaction amount in dollars (negative for outflows)
+    - `payee` (optional string) - Transaction payee/description
+  - `tolerance` (number, default: 3) - Date range tolerance in days for matching
+- **Output**: Detailed matching report with:
+  - Summary statistics (match rate, counts)
+  - Matched transactions grouped by confidence level (exact, high, medium, low)
+  - Unmatched bank transactions (missing from YNAB)
+  - Unmatched YNAB transactions (missing from bank)
+  - Actionable recommendations
+
+**reconcile-account-with-adjustment**
+- **Input**:
+  - `budgetId` (string) - Budget ID or 'last-used'
+  - `accountId` (string) - Account ID to reconcile
+  - `targetBalance` (number) - Expected ending balance in dollars
+  - `reconciliationDate` (string) - Reconciliation date (ISO format: YYYY-MM-DD)
+  - `createAdjustment` (boolean) - Auto-create adjustment if needed
+  - `adjustmentMemo` (optional string) - Custom memo for adjustment
+- **Output**: Complete reconciliation summary with:
+  - Number of transactions reconciled
+  - Balance comparison (starting vs target vs actual)
+  - Adjustment transaction details (if created)
+  - Success/warning status
+  - Next steps and tips
+- **Special Notes**:
+  - Uses YNAB's system payee ID for reconciliation adjustments
+  - Adjustments are categorized to "Inflow: Ready to Assign"
+  - Only reconciles cleared/uncleared transactions (skips already reconciled)
 
 ### Prompts
 - **analyze-budget** - Analyze a YNAB budget and provide insights
@@ -215,10 +265,31 @@ The reconciliation tools support common workflows for keeping your YNAB data syn
 3. Use `reconcile-account-transactions` with your statement ending date and balance
 4. Review any discrepancies and resolve them
 
-### Bulk Status Updates
-1. Use `find-transactions-for-reconciliation` to identify transactions needing updates
-2. Use `bulk-update-transaction-status` to update multiple transactions at once
-3. Use `reconciliation-status-report` to verify the changes
+#### Bulk Status Update
+
+1. Find transactions needing updates: `find-transactions-for-reconciliation`
+2. Update multiple transactions at once: `bulk-update-transaction-status`
+3. Verify changes: `reconciliation-status-report`
+
+#### Bank Transaction Matching
+
+1. Export transactions from your bank (CSV/statement)
+2. Format bank data as JSON array with date, amount, and optional payee
+3. Run `match-bank-transactions` to compare with YNAB
+4. Review matches, especially low-confidence ones
+5. Import missing transactions using `create-transaction`
+6. Update matched transactions using `bulk-update-transaction-status`
+
+#### Complete Reconciliation with Adjustment
+
+1. Get your bank statement ending balance
+2. Run `reconcile-account-with-adjustment` with:
+   - The account ID
+   - Bank statement date
+   - Bank statement ending balance
+   - `createAdjustment: true`
+3. Review the reconciliation summary
+4. If adjustment was created, it will appear in "Inflow: Ready to Assign"
 
 ### Transaction Status States
 - **Uncleared**: New transactions that haven't been verified against bank records
